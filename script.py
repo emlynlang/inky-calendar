@@ -37,7 +37,7 @@ def get_weather():
 
 # Dynamic Weather Icon Renderer (Vector Shapes)
 def draw_weather_icon(draw, code, x, y, size=80):
-    # FIXED: Populated the target WMO weather matching code arrays
+    # FIXED: Populated the target WMO weather matching code lists explicitly
     if code in: # Sunny / Clear Sky
         draw.ellipse([x, y, x+size, y+size], fill="yellow", outline="orange", width=3)
     elif code in: # Partly Cloudy / Overcast / Fog
