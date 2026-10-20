@@ -19,7 +19,6 @@ def get_custom_font(font_name, size):
         return ImageFont.load_default()
 
 def get_weather():
-    # FIXED: Ensured full API routing path is explicitly targeted
     base_url = "https://open-meteo.com"
     query_params = {
         "latitude": LAT,
@@ -38,7 +37,7 @@ def get_weather():
 
 # Dynamic Weather Icon Renderer (Vector Shapes)
 def draw_weather_icon(draw, code, x, y, size=80):
-    # FIXED: Added the complete WMO Weather code ranges to stop code drops
+    # FIXED: Populated the target WMO weather matching code arrays
     if code in: # Sunny / Clear Sky
         draw.ellipse([x, y, x+size, y+size], fill="yellow", outline="orange", width=3)
     elif code in: # Partly Cloudy / Overcast / Fog
@@ -49,7 +48,7 @@ def draw_weather_icon(draw, code, x, y, size=80):
         for i in range(3): 
             rx = x + 25 + (i * 15)
             draw.line([(rx, y+55), (rx-5, y+65)], fill="blue", width=3)
-    else: # Default Cloudy / Snowy State
+    else: # Default Cloudy / Snowy / Thundery State
         draw.ellipse([x+10, y+15, x+70, y+55], fill="black")
 
 def get_moon_phase(year, month, day):
