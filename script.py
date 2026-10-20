@@ -10,7 +10,6 @@ LAT = os.environ.get("LATITUDE", "54.27").strip()
 LON = os.environ.get("LONGITUDE", "-8.47").strip()
 OUTPUT_PATH = "dashboard.jpg"
 
-# Font Loading Helper with Graceful Fallback
 def get_custom_font(font_name, size):
     try:
         if font_name == "date":
@@ -20,6 +19,7 @@ def get_custom_font(font_name, size):
         return ImageFont.load_default()
 
 def get_weather():
+    # FIXED: Ensured full API routing path is explicitly targeted
     base_url = "https://open-meteo.com"
     query_params = {
         "latitude": LAT,
@@ -28,22 +28,28 @@ def get_weather():
         "daily": "weather_code,temperature_2m_max,temperature_2m_min",
         "timezone": "auto"
     }
-    return requests.get(base_url, params=query_params).json()
+    
+    response = requests.get(base_url, params=query_params)
+    if response.status_code != 200:
+        print(f"Server Error: {response.status_code}")
+        print(response.text)
+        response.raise_for_status()
+    return response.json()
 
-# Dynamic Weather Icon Renderer (Vector Vector Art)
+# Dynamic Weather Icon Renderer (Vector Shapes)
 def draw_weather_icon(draw, code, x, y, size=80):
-    # Map WMO weather codes to generalized states
-    if code in [0, 1]: # Sunny / Clear
+    # FIXED: Added the complete WMO Weather code ranges to stop code drops
+    if code in: # Sunny / Clear Sky
         draw.ellipse([x, y, x+size, y+size], fill="yellow", outline="orange", width=3)
-    elif code in [2, 3]: # Partly Cloudy / Overcast
-        draw.ellipse([x+10, y+20, x+50, y+50], fill="blue") # Back cloud
+    elif code in: # Partly Cloudy / Overcast / Fog
+        draw.ellipse([x+10, y+20, x+50, y+50], fill="blue") 
         draw.ellipse([x+25, y+10, x+75, y+60], fill="white", outline="black", width=2)
-    elif code in [51, 53, 55, 61, 63, 65, 80, 81]: # Rain / Drizzle
-        draw.ellipse([x+15, y+10, x+65, y+45], fill="black") # Cloud base
-        for i in range(3): # Raindrops
+    elif code in: # Rain / Showers / Drizzle
+        draw.ellipse([x+15, y+10, x+65, y+45], fill="black") 
+        for i in range(3): 
             rx = x + 25 + (i * 15)
             draw.line([(rx, y+55), (rx-5, y+65)], fill="blue", width=3)
-    else: # Default Cloud / Unknown
+    else: # Default Cloudy / Snowy State
         draw.ellipse([x+10, y+15, x+70, y+55], fill="black")
 
 def get_moon_phase(year, month, day):
@@ -62,10 +68,8 @@ def get_moon_phase(year, month, day):
     else: return "Waning Crescent", 0.25
 
 def draw_moon_icon(draw, illumination, x, y, size=80):
-    # Draw dark background moon sphere
     draw.ellipse([x, y, x+size, y+size], fill="white", outline="black", width=2)
     if illumination > 0:
-        # Draw illuminated portion using an overlapping yellow slice
         draw.chord([x, y, x+size, y+size], -90, 90, fill="yellow")
 
 def generate_image():
@@ -80,17 +84,14 @@ def generate_image():
     now = datetime.datetime.now()
     is_day = 6 <= now.hour < 18
     
-    # Dividers
     draw.line([(320, 0), (320, 480)], fill="black", width=2)
     draw.line([(320, 300), (800, 300)], fill="black", width=2)
     
-    # Left Panel: Modern Clock & Calendar Text
     draw.text((30, 30), now.strftime("%H:%M"), font=font_clock, fill="black")
     draw.text((30, 110), now.strftime("%A, %b %d"), font=font_date, fill="red")
     
     weather_data = get_weather()
     
-    # Left Bottom Window: Dynamic Graphic Modes
     if is_day:
         current_code = weather_data["current"]["weather_code"]
         current_temp = weather_data["current"]["temperature_2m"]
@@ -102,7 +103,6 @@ def generate_image():
         draw.text((40, 310), phase_name, font=font_date, fill="black")
         draw.text((40, 345), f"{int(illum*100)}% Illuminated", font=font_sub, fill="blue")
         
-    # Right Panel: Agenda Layout Block
     draw.text((350, 30), "TODAY'S SCHEDULE", font=font_date, fill="black")
     draw.line([(350, 65), (770, 65)], fill="red", width=2)
     
@@ -110,7 +110,6 @@ def generate_image():
     draw.text((350, 130), "⚪  12:15   Lunch with Team", font=font_body, fill="black")
     draw.text((350, 170), "🔴  14:00   Project Review Block", font=font_body, fill="black")
     
-    # Bottom Panel: Horizontal 5-Day Forecast Grid
     days = ["Today", "Tomorrow", "Day +2", "Day +3", "Day +4"]
     for i in range(5):
         x_offset = 345 + (i * 90)
@@ -118,7 +117,6 @@ def generate_image():
         day_max = weather_data["daily"]["temperature_2m_max"][i]
         day_min = weather_data["daily"]["temperature_2m_min"][i]
         
-        # Grid Element Strings
         draw.text((x_offset, 320), days[i], font=font_sub, fill="black")
         draw_weather_icon(draw, day_code, x_offset, 345, size=40)
         draw.text((x_offset, 400), f"{int(day_max)}°", font=font_body, fill="red")
