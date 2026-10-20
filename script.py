@@ -6,15 +6,24 @@ from PIL import Image, ImageDraw, ImageFont
 
 # SECURE CONFIGURATION (Pulls safely from GitHub Vault)
 CALENDAR_URL = os.environ.get("CALENDAR_URL")
-LAT = os.environ.get("LATITUDE", "54.27")   
-LON = os.environ.get("LONGITUDE", "-8.47")
+LAT = os.environ.get("LATITUDE", "54.27").strip()   
+LON = os.environ.get("LONGITUDE", "-8.47").strip()
 WEATHER_KEY = os.environ.get("WEATHER_API_KEY", "") 
 
 OUTPUT_PATH = "dashboard.jpg"
 
 def get_weather():
-    url = f"https://open-meteo.com{LAT}&longitude={LON}&current_weather=true&daily=weathercode,temperature_2m_max,temperature_2m_min&timezone=auto"
-    res = requests.get(url).json()
+    # FIXED: Rebuilt structure using explicit URL dictionary keys to prevent parsing drops
+    base_url = "https://open-meteo.com"
+    query_params = {
+        "latitude": LAT,
+        "longitude": LON,
+        "current_weather": "true",
+        "daily": "weathercode,temperature_2m_max,temperature_2m_min",
+        "timezone": "auto"
+    }
+    
+    res = requests.get(base_url, params=query_params).json()
     return res
 
 def get_moon_phase(year, month, day):
@@ -82,3 +91,4 @@ def generate_image():
 
 if __name__ == "__main__":
     generate_image()
+
