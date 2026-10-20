@@ -4,27 +4,42 @@ import os
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-# SECURE CONFIGURATION (Pulls safely from GitHub Vault)
+# SECURE CONFIGURATION (Pulls safely from GitHub Vault or direct fallback lines)
 CALENDAR_URL = os.environ.get("CALENDAR_URL")
 LAT = os.environ.get("LATITUDE", "54.27").strip()   
 LON = os.environ.get("LONGITUDE", "-8.47").strip()
-WEATHER_KEY = os.environ.get("WEATHER_API_KEY", "") 
 
 OUTPUT_PATH = "dashboard.jpg"
 
 def get_weather():
-    # FIXED: Rebuilt structure using explicit URL dictionary keys to prevent parsing drops
-    base_url = "https://open-meteo.com"
+    base_url = "https://api.open-meteo.com/v1/forecast"
+    
+    # UPDATED: Matched to the exact parameters Open-Meteo expects
     query_params = {
         "latitude": LAT,
         "longitude": LON,
-        "current_weather": "true",
-        "daily": "weathercode,temperature_2m_max,temperature_2m_min",
+        "current": "temperature_2m,weather_code", # Modern parameter configuration
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min", # Fixed legacy weathercode text
         "timezone": "auto"
     }
     
-    res = requests.get(base_url, params=query_params).json()
-    return res
+    response = requests.get(base_url, params=query_params)
+    
+    # SAFETY DEBUG BLOCK: If the web request is not perfectly healthy (HTTP 200),
+    # print out the raw text error message right into the GitHub log for visibility.
+    if response.status_code != 200:
+        print(f"--- API CONFIGURATION ERROR REPORT ---")
+        print(f"HTTP Server Status Code: {response.status_code}")
+        print(f"Raw Server Error Content: {response.text}")
+        print(f"---------------------------------------")
+        response.raise_for_status() # Cleanly halts the runner with the details active
+
+    try:
+        return response.json()
+    except Exception as json_err:
+        print("Failed to decode JSON data. Raw content was:")
+        print(response.text)
+        raise json_err
 
 def get_moon_phase(year, month, day):
     if month < 3:
@@ -64,9 +79,10 @@ def generate_image():
     weather_data = get_weather()
     
     if is_day:
-        current_temp = weather_data["current_weather"]["temperature"]
+        # Parsed using modern Open-Meteo dictionary paths
+        current_temp = weather_data["current"]["temperature_2m"]
         draw.text((20, 200), f"{current_temp}°C", fill="blue")
-        draw.text((20, 240), "Current: Scattered", fill="black")
+        draw.text((20, 240), "Current Sky", fill="black")
     else:
         phase_name = get_moon_phase(now.year, now.month, now.day)
         draw.text((20, 200), phase_name, fill="black")
@@ -91,4 +107,3 @@ def generate_image():
 
 if __name__ == "__main__":
     generate_image()
-
