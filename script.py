@@ -1,26 +1,28 @@
-"""Renders an 800x480 weather + calendar dashboard (dashboard.jpg) for a
+"""Renders an 800x480 weather + tide dashboard (dashboard.jpg) for a
 Pimoroni Inky Frame 7.3". Run by the GitHub Actions workflow every 30 minutes.
 
 Environment variables (all optional; unset or empty falls back to a default):
-  CALENDAR_URL  secret ICS feed URL (e.g. Google Calendar "secret address in iCal format")
   LATITUDE / LONGITUDE  location, default Dromore West
   TIMEZONE      IANA timezone, default Europe/Dublin
+  TIDE_LATITUDE / TIDE_LONGITUDE  optional sea point for tides
 """
 import datetime
 import math
 import os
-import re
 from zoneinfo import ZoneInfo
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
 # ------------------------------------------------------------------ config
-CALENDAR_URL = (os.environ.get("CALENDAR_URL") or "").strip()
 LAT = (os.environ.get("LATITUDE") or "54.24").strip()
 LON = (os.environ.get("LONGITUDE") or "-8.80").strip()
 TZ_NAME = (os.environ.get("TIMEZONE") or "Europe/Dublin").strip()
 TZ = ZoneInfo(TZ_NAME)
+# Offshore point used for tides (the marine model has no data over land). Approximate:
+# a spot in the sea just north of Dromore West. Override with TIDE_LATITUDE / TIDE_LONGITUDE.
+TIDE_LAT = (os.environ.get("TIDE_LATITUDE") or "54.33").strip()
+TIDE_LON = (os.environ.get("TIDE_LONGITUDE") or "-8.85").strip()
 OUTPUT_PATH = "dashboard.jpg"
 W, H = 800, 480
 
@@ -32,6 +34,8 @@ RED = (200, 40, 40)
 BLUE = (40, 60, 170)
 GREY = (110, 110, 110)
 SUN = (246, 174, 72)
+ORANGE_DARK = (226, 130, 40)
+TIDE_FILL = (176, 204, 242)
 CLOUD_FRONT = (192, 202, 222)
 CLOUD_BACK = (122, 142, 182)
 RAIN = (70, 110, 190)
@@ -260,153 +264,151 @@ def draw_moon(img, cx, cy, r, p):
     img.paste(layer, (int(cx - n / 2), int(cy - n / 2)), layer)
 
 
-# ------------------------------------------------------------------ calendar (ICS)
-def _unescape(s):
-    return s.replace("\\n", " ").replace("\\N", " ").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+# ------------------------------------------------------------------ tides
+def get_tides():
+    """Hourly sea level (m, incl. tides) for today and tomorrow, as [(datetime, metres)]."""
+    r = requests.get(
+        "https://marine-api.open-meteo.com/v1/marine",
+        params={
+            "latitude": TIDE_LAT,
+            "longitude": TIDE_LON,
+            "hourly": "sea_level_height_msl",
+            "timezone": TZ_NAME,
+            "forecast_days": 2,
+        },
+        timeout=20,
+    )
+    r.raise_for_status()
+    h = r.json()["hourly"]
+    series = [(datetime.datetime.fromisoformat(t).replace(tzinfo=TZ), v)
+              for t, v in zip(h["time"], h["sea_level_height_msl"]) if v is not None]
+    if len(series) < 24:
+        raise ValueError("no tide data for this point")
+    return series
 
 
-def _prop(line):
-    head, _, value = line.partition(":")
-    parts = head.split(";")
-    params = {}
-    for p in parts[1:]:
-        k, _, v = p.partition("=")
-        params[k.upper()] = v.strip('"')
-    return parts[0].upper(), params, value
+def _cr(p0, p1, p2, p3, t):
+    return 0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t
+                  + (-p0 + 3 * p1 - 3 * p2 + p3) * t ** 3)
 
 
-def _dt(value, params):
-    """-> (aware datetime in TZ, is_all_day)"""
-    value = value.strip()
-    if params.get("VALUE") == "DATE" or len(value) == 8:
-        return datetime.datetime.strptime(value[:8], "%Y%m%d").replace(tzinfo=TZ), True
-    if value.endswith("Z"):
-        dt = datetime.datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
-        return dt.astimezone(TZ), False
-    dt = datetime.datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
-    zone = TZ
-    if "TZID" in params:
-        try:
-            zone = ZoneInfo(params["TZID"])
-        except Exception:
-            pass  # unknown zone name (e.g. Outlook "GMT Standard Time"): assume local
-    return dt.replace(tzinfo=zone).astimezone(TZ), False
+def _curve(pts, step=0.1):
+    """Smooth [(hour, value)] samples through the hourly points (Catmull-Rom spline)."""
+    out, n = [], len(pts)
+    for i in range(n - 1):
+        p0, p1 = pts[max(i - 1, 0)][1], pts[i][1]
+        p2, p3 = pts[i + 1][1], pts[min(i + 2, n - 1)][1]
+        h0, h1 = pts[i][0], pts[i + 1][0]
+        k = max(1, int(round((h1 - h0) / step)))
+        for j in range(k):
+            out.append((h0 + (h1 - h0) * j / k, _cr(p0, p1, p2, p3, j / k)))
+    out.append(pts[-1])
+    return out
 
 
-_DAYS = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
-
-
-def _parse_events(text):
-    text = re.sub(r"\r?\n[ \t]", "", text)  # unfold
-    events, cur = [], None
-    for line in text.splitlines():
-        if line == "BEGIN:VEVENT":
-            cur = {"EXDATE": []}
-        elif line == "END:VEVENT":
-            if cur is not None and "DTSTART" in cur:
-                events.append(cur)
-            cur = None
-        elif cur is not None and ":" in line:
-            name, params, value = _prop(line)
-            if name == "EXDATE":
-                for v in value.split(","):
-                    try:
-                        cur["EXDATE"].append(_dt(v, params)[0].date())
-                    except ValueError:
-                        pass
-            elif name in ("DTSTART", "DTEND", "RECURRENCE-ID"):
-                try:
-                    cur[name] = _dt(value, params)
-                except ValueError:
-                    pass
-            elif name in ("SUMMARY", "RRULE", "UID", "STATUS"):
-                cur[name] = _unescape(value)
-    return events
-
-
-def _rule_matches(day, start_date, rule):
-    """Does a recurrence rule produce an occurrence on `day`? (DAILY/WEEKLY/MONTHLY/YEARLY)"""
-    if day < start_date:
-        return False
-    interval = int(rule.get("INTERVAL", 1))
-    freq = rule.get("FREQ")
-    if freq == "DAILY":
-        return (day - start_date).days % interval == 0
-    if freq == "WEEKLY":
-        wanted = [_DAYS.index(x[-2:]) for x in rule["BYDAY"].split(",")] if "BYDAY" in rule \
-            else [start_date.weekday()]
-        weeks = ((day - datetime.timedelta(days=day.weekday())) -
-                 (start_date - datetime.timedelta(days=start_date.weekday()))).days // 7
-        return day.weekday() in wanted and weeks % interval == 0
-    if freq == "MONTHLY":
-        if "BYDAY" in rule:      # e.g. "2nd Tuesday": not supported
-            return False
-        months = (day.year - start_date.year) * 12 + day.month - start_date.month
-        return day.day == start_date.day and months % interval == 0
-    if freq == "YEARLY":
-        return (day.month, day.day) == (start_date.month, start_date.day) and \
-            (day.year - start_date.year) % interval == 0
-    return False
-
-
-def events_for_day(text, day):
-    """Return [(sort_key, 'HH:MM' or 'All day', title)] for the given date."""
-    events = _parse_events(text)
-    overridden = {(e.get("UID"), e["RECURRENCE-ID"][0].date()) for e in events if "RECURRENCE-ID" in e}
-    day_start = datetime.datetime.combine(day, datetime.time(), tzinfo=TZ)
-    day_end = day_start + datetime.timedelta(days=1)
+def find_extrema(series):
+    """High and low tide times: [(datetime, 'H' or 'L')], refined between the hourly points."""
     out = []
-    for e in events:
-        if e.get("STATUS", "").upper() == "CANCELLED":
-            continue
-        start, all_day = e["DTSTART"]
-        title = e.get("SUMMARY", "(no title)")
-        if "RRULE" in e and "RECURRENCE-ID" not in e:
-            rule = dict(p.split("=", 1) for p in e["RRULE"].split(";") if "=" in p)
-            if day in e["EXDATE"] or (e.get("UID"), day) in overridden:
-                continue
-            if "UNTIL" in rule:
-                try:
-                    if day > _dt(rule["UNTIL"], {})[0].date():
-                        continue
-                except ValueError:
-                    pass
-            if not _rule_matches(day, start.date(), rule):
-                continue
-            if "COUNT" in rule:
-                n, d0 = 0, start.date()
-                while d0 <= day:
-                    n += _rule_matches(d0, start.date(), rule) and d0 not in e["EXDATE"]
-                    d0 += datetime.timedelta(days=1)
-                if n > int(rule["COUNT"]):
-                    continue
-            occ = datetime.datetime.combine(day, start.timetz().replace(tzinfo=None), tzinfo=TZ)
-            out.append((occ if not all_day else day_start, "All day" if all_day else occ.strftime("%H:%M"), title, all_day))
-            continue
-        end = e["DTEND"][0] if "DTEND" in e else start
-        if not (start < day_end and max(end, start + datetime.timedelta(seconds=1)) > day_start):
-            continue
-        out.append((start if not all_day else day_start, "All day" if all_day else
-                    ("00:00" if start < day_start else start.strftime("%H:%M")), title, all_day))
-    out.sort(key=lambda x: (not x[3], x[0]))
-    return [(label, title) for _, label, title, _ in out]
+    for i in range(1, len(series) - 1):
+        a, b, c = series[i - 1][1], series[i][1], series[i + 1][1]
+        if (b > a and b >= c) or (b < a and b <= c):
+            den = a - 2 * b + c
+            off = max(-1.0, min(1.0, 0.5 * (a - c) / den)) if den else 0.0
+            out.append((series[i][0] + datetime.timedelta(hours=off), "H" if b > a else "L"))
+    return out
 
 
-def get_events(day):
-    """Today's events from CALENDAR_URL. Returns (events, error_message_or_None)."""
-    if not CALENDAR_URL:
-        return [], "No calendar linked"
-    try:
-        r = requests.get(CALENDAR_URL, timeout=20)
-        r.raise_for_status()
-        return events_for_day(r.text, day), None
-    except Exception as exc:  # keep the dashboard alive if the calendar is down
-        print("Calendar error:", exc)
-        return [], "Calendar unavailable"
+def _fit_size(d, s, bold, max_w, start):
+    size = start
+    while size > 10 and d.textlength(s, font=font(size, bold)) > max_w:
+        size -= 1
+    return size
+
+
+def draw_tides(img, d, box, series, now):
+    x0, y0, x1, y1 = box
+    d.rounded_rectangle(box, radius=10, outline=BLACK, width=2)
+    d.text((x0 + 14, y0 + 6), "TIDES TODAY", font=font(13, True), fill=GREY)
+    midnight = datetime.datetime.combine(now.date(), datetime.time(), tzinfo=TZ)
+    pts = []
+    for t, v in series or []:
+        hrs = (t - midnight).total_seconds() / 3600.0
+        if -1.5 <= hrs <= 25.5:
+            pts.append((hrs, v))
+    if len(pts) < 6:
+        d.text((x0 + 14, y0 + 56), "Tide data unavailable", font=font(18), fill=GREY)
+        return
+
+    curve = [(h, v) for h, v in _curve(pts) if 0 <= h <= 24]
+    px0, px1, py0, py1 = x0 + 18, x1 - 18, y0 + 52, y1 - 50
+    vmin, vmax = min(v for _, v in curve), max(v for _, v in curve)
+    span = max(vmax - vmin, 0.5)
+
+    def X(h):
+        return px0 + h / 24.0 * (px1 - px0)
+
+    def Y(v):
+        return py1 - (v - vmin) / span * (py1 - py0)
+
+    def at(h):  # curve value at hour h
+        return min(curve, key=lambda p: abs(p[0] - h))[1]
+
+    # smooth filled curve, drawn 4x larger then shrunk for clean edges
+    pad = 8
+    lw, lh = (px1 - px0) + 2 * pad, (py1 - py0) + 2 * pad
+    layer = Image.new("RGBA", (lw * SS, lh * SS), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+
+    def L(x, y):
+        return ((x - px0 + pad) * SS, (y - py0 + pad) * SS)
+
+    line = [L(X(h), Y(v)) for h, v in curve]
+    ld.polygon(line + [L(X(24), py1), L(X(0), py1)], fill=TIDE_FILL)
+    ld.line(line, fill=BLUE, width=3 * SS, joint="curve")
+    extrema = [(t, k) for t, k in find_extrema(series)
+               if 0 <= (t - midnight).total_seconds() / 3600.0 <= 24]
+    for t, k in extrema:
+        h = (t - midnight).total_seconds() / 3600.0
+        cx, cy = L(X(h), Y(at(h)))
+        ld.ellipse([cx - 4 * SS, cy - 4 * SS, cx + 4 * SS, cy + 4 * SS], fill=BLUE)
+    layer = layer.resize((lw, lh), Image.LANCZOS)
+    img.paste(layer, (px0 - pad, py0 - pad), layer)
+
+    # axis, ticks and hour labels
+    d.line([(px0, py1 + 1), (px1, py1 + 1)], fill=GREY, width=1)
+    for hr in (0, 6, 12, 18, 24):
+        d.line([(X(hr), py1 + 1), (X(hr), py1 + 5)], fill=GREY, width=1)
+        d.text((X(hr), y1 - 22), "%02d" % (hr % 24), font=font(12), fill=GREY, anchor="ma")
+
+    # high / low tide times
+    for t, k in extrema:
+        h = (t - midnight).total_seconds() / 3600.0
+        cx = min(max(X(h), px0 + 16), px1 - 16)
+        y = Y(at(h)) - 20 if k == "H" else Y(at(h)) + 6
+        d.text((cx, y), t.strftime("%H:%M"), font=font(12, True), fill=BLACK, anchor="ma")
+
+    # "now" marker
+    hn = (now - midnight).total_seconds() / 3600.0
+    if 0 <= hn <= 24:
+        for yy in range(py0 - 4, py1 + 2, 6):
+            d.line([(X(hn), yy), (X(hn), yy + 3)], fill=RED, width=2)
+        cx, cy = X(hn), Y(at(hn))
+        d.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=WHITE)
+        d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=RED)
+
+
+def _sun_glyph(d, cx, cy, rising):
+    """Small half-sun on a horizon line with an up/down arrow."""
+    d.pieslice([cx - 13, cy - 13, cx + 13, cy + 13], 180, 360, fill=SUN)
+    d.line([(cx - 20, cy + 1), (cx + 20, cy + 1)], fill=BLACK, width=2)
+    if rising:
+        d.polygon([(cx, cy - 25), (cx - 6, cy - 16), (cx + 6, cy - 16)], fill=ORANGE_DARK)
+    else:
+        d.polygon([(cx, cy - 16), (cx - 6, cy - 25), (cx + 6, cy - 25)], fill=ORANGE_DARK)
 
 
 # ------------------------------------------------------------------ drawing
-def generate_image(weather, events, cal_error, now, out_path=OUTPUT_PATH):
+def generate_image(weather, tides, now, out_path=OUTPUT_PATH):
     img = Image.new("RGB", (W, H), WHITE)
     d = ImageDraw.Draw(img)
 
@@ -419,20 +421,29 @@ def generate_image(weather, events, cal_error, now, out_path=OUTPUT_PATH):
     d.rectangle([320, 0, 321, H], fill=BLACK)
     d.rectangle([322, 300, W, 301], fill=BLACK)
 
-    # clock and date
-    d.text((24, 6), now.strftime("%H:%M"), font=font(86, True), fill=BLACK)
-    d.text((26, 104), now.strftime("%A, %d %b"), font=font(24), fill=RED)
+    # date
+    date_s = now.strftime("%A, %d %b")
+    d.text((24, 10), date_s, font=font(_fit_size(d, date_s, True, 284, 28), True), fill=RED)
 
-    # current weather
+    # current weather (large)
     code = cur["weather_code"]
-    draw_icon(img, code, 72, 200, 54, night=is_night)
-    d.text((140, 160), "%d°C" % round(cur["temperature_2m"]), font=font(52, True), fill=BLACK)
-    d.text((142, 222), describe(code), font=font(18), fill=BLACK)
-    d.text((26, 262), "Feels %d°  ·  Humidity %d%%  ·  %d km/h" % (
+    draw_icon(img, code, 80, 122, 68, night=is_night)
+    temp_s = "%d°C" % round(cur["temperature_2m"])
+    d.text((152, 56), temp_s, font=font(_fit_size(d, temp_s, True, 160, 78), True), fill=BLACK)
+    d.text((154, 150), fit(d, describe(code), font(22), 160), font=font(22), fill=BLACK)
+    d.text((26, 192), "Feels %d°  ·  Humidity %d%%  ·  %d km/h" % (
         round(cur["apparent_temperature"]), round(cur["relative_humidity_2m"]),
         round(cur["wind_speed_10m"])), font=font(14), fill=GREY)
 
-    # bottom-left panel: moon after sunset, sun times by day
+    # sunrise / sunset
+    _sun_glyph(d, 44, 256, True)
+    d.text((82, 228), "Sunrise", font=font(12), fill=GREY)
+    d.text((82, 244), sunrise.strftime("%H:%M"), font=font(24, True), fill=BLACK)
+    _sun_glyph(d, 188, 256, False)
+    d.text((226, 228), "Sunset", font=font(12), fill=GREY)
+    d.text((226, 244), sunset.strftime("%H:%M"), font=font(24, True), fill=BLACK)
+
+    # bottom-left panel: moon after sunset, next tides by day
     d.rounded_rectangle([12, 312, 308, 470], radius=14,
                         fill=MOON_BG if is_night else WHITE, outline=BLACK, width=2)
     if is_night:
@@ -444,23 +455,25 @@ def generate_image(weather, events, cal_error, now, out_path=OUTPUT_PATH):
         illum = (1 - math.cos(2 * math.pi * p)) / 2 * 100
         d.text((158, 346 + len(words) * 28 + 6), "%d%% lit" % round(illum), font=font(16), fill=MOON_LIT)
     else:
-        draw_icon(img, 0, 76, 391, 46)
-        d.text((140, 352), "Sunrise  " + sunrise.strftime("%H:%M"), font=font(18, True), fill=BLACK)
-        d.text((140, 386), "Sunset   " + sunset.strftime("%H:%M"), font=font(18, True), fill=BLACK)
+        d.text((28, 324), "NEXT TIDES", font=font(13, True), fill=GREY)
+        nxt = {}
+        for t, k in find_extrema(tides or []):
+            if t > now and k not in nxt:
+                nxt[k] = t
+        if nxt:
+            for i, (k, t) in enumerate(sorted(nxt.items(), key=lambda kv: kv[1])):
+                name = "High" if k == "H" else "Low"
+                y = 358 + i * 50
+                tri = [(44, y + 4), (34, y + 22), (54, y + 22)] if k == "H" else \
+                      [(44, y + 22), (34, y + 4), (54, y + 4)]
+                d.polygon(tri, fill=BLUE)
+                day = "" if t.date() == now.date() else " " + t.strftime("%a")
+                d.text((72, y), "%s %s%s" % (name, t.strftime("%H:%M"), day), font=font(22, True), fill=BLACK)
+        else:
+            d.text((28, 370), "Tide data unavailable", font=font(18), fill=GREY)
 
-    # agenda
-    d.text((344, 20), "TODAY'S SCHEDULE", font=font(20, True), fill=BLACK)
-    d.rectangle([344, 54, 780, 56], fill=RED)
-    if events:
-        for i, (label, title) in enumerate(events[:6]):
-            y = 72 + i * 36
-            d.ellipse([344, y + 7, 354, y + 17], fill=RED)
-            d.text((364, y), label, font=font(18, True), fill=BLACK)
-            d.text((448, y), fit(d, title, font(18), 780 - 448), font=font(18), fill=BLACK)
-        if len(events) > 6:
-            d.text((344, 72 + 6 * 36 - 4), "+%d more" % (len(events) - 6), font=font(14), fill=GREY)
-    else:
-        d.text((344, 76), cal_error or "Nothing scheduled today", font=font(18), fill=GREY)
+    # tide chart (top right)
+    draw_tides(img, d, (334, 10, 786, 292), tides, now)
 
     # 5-day forecast
     for i in range(5):
@@ -484,8 +497,12 @@ def generate_image(weather, events, cal_error, now, out_path=OUTPUT_PATH):
 
 def main():
     now = datetime.datetime.now(TZ)
-    events, cal_error = get_events(now.date())
-    generate_image(get_weather(), events, cal_error, now)
+    try:
+        tides = get_tides()
+    except Exception as exc:  # the dashboard still renders without tides
+        print("Tide error:", exc)
+        tides = None
+    generate_image(get_weather(), tides, now)
 
 
 if __name__ == "__main__":
