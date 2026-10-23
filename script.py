@@ -1,6 +1,10 @@
 """Renders an 800x480 weather + tide dashboard (dashboard.jpg) for a
 Pimoroni Inky Frame 7.3". Run by the GitHub Actions workflow every 30 minutes.
 
+Everything is drawn in the panel's seven pure inks only (no greys, no pastels,
+no anti-aliased blends), so the frame shows solid, crisp colours instead of
+dithered speckle.
+
 Environment variables (all optional; unset or empty falls back to a default):
   LATITUDE / LONGITUDE  location, default Dromore West
   TIMEZONE      IANA timezone, default Europe/Dublin
@@ -12,7 +16,7 @@ import os
 from zoneinfo import ZoneInfo
 
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 # ------------------------------------------------------------------ config
 LAT = (os.environ.get("LATITUDE") or "54.24").strip()
@@ -26,23 +30,18 @@ TIDE_LON = (os.environ.get("TIDE_LONGITUDE") or "-8.85").strip()
 OUTPUT_PATH = "dashboard.jpg"
 W, H = 800, 480
 
-# Colours. The Inky Frame's JPEG decoder dithers to its 7 inks, so pastel
-# shades come out as soft stippling on the panel.
-BLACK = (20, 20, 20)
+# The seven inks. Values are well separated so the Pico maps each one to the right ink.
+BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
-RED = (200, 40, 40)
-BLUE = (40, 60, 170)
-GREY = (110, 110, 110)
-SUN = (246, 174, 72)
-ORANGE_DARK = (226, 130, 40)
-TIDE_FILL = (176, 204, 242)
-CLOUD_FRONT = (192, 202, 222)
-CLOUD_BACK = (122, 142, 182)
-RAIN = (70, 110, 190)
-BOLT = (245, 200, 50)
-MOON_BG = (22, 26, 44)
-MOON_DARK = (62, 68, 96)
-MOON_LIT = (246, 232, 180)
+GREEN = (30, 140, 70)
+BLUE = (30, 50, 190)
+RED = (190, 30, 30)
+YELLOW = (255, 235, 40)
+ORANGE = (230, 120, 30)
+INKS = [BLACK, WHITE, GREEN, BLUE, RED, YELLOW, ORANGE]
+# Rough look of the real (muted) panel inks, used only for the preview picture.
+PANEL_LOOK = [(38, 34, 46), (222, 224, 216), (66, 106, 82), (58, 68, 128),
+              (168, 66, 76), (214, 192, 86), (196, 126, 88)]
 
 # ------------------------------------------------------------------ fonts
 _FONT_CACHE = {}
@@ -67,7 +66,7 @@ def font(size, bold=False):
                     vals = [a["default"] for a in axes]
                     for i, a in enumerate(axes):
                         if a["name"] in (b"Weight", "Weight"):
-                            vals[i] = 700
+                            vals[i] = 800
                     f.set_variation_by_axes(vals)
                 except Exception:
                     pass
@@ -80,6 +79,26 @@ def font(size, bold=False):
     return f
 
 
+class PixelDraw:
+    """ImageDraw wrapper whose text is drawn without anti-aliasing, so every
+    pixel is a pure ink (anti-aliased blends would turn into stray coloured dots)."""
+
+    def __init__(self, img):
+        self.img = img
+        self.d = ImageDraw.Draw(img)
+
+    def __getattr__(self, name):
+        return getattr(self.d, name)
+
+    def text(self, xy, s, font=None, fill=BLACK, anchor="la", **_):
+        l, t, r, b = self.d.textbbox(xy, s, font=font, anchor=anchor)
+        l, t, r, b = int(l) - 2, int(t) - 2, int(r) + 3, int(b) + 3
+        mask = Image.new("L", (r - l, b - t), 0)
+        ImageDraw.Draw(mask).text((xy[0] - l, xy[1] - t), s, font=font, fill=255, anchor=anchor)
+        mask = mask.point(lambda v: 255 if v >= 100 else 0)
+        self.img.paste(fill, (l, t, r, b), mask)
+
+
 def fit(d, s, f, max_w):
     """Truncate s with an ellipsis so it fits in max_w pixels."""
     if d.textlength(s, font=f) <= max_w:
@@ -87,6 +106,13 @@ def fit(d, s, f, max_w):
     while s and d.textlength(s + "…", font=f) > max_w:
         s = s[:-1]
     return s.rstrip() + "…"
+
+
+def _fit_size(d, s, bold, max_w, start):
+    size = start
+    while size > 10 and d.textlength(s, font=font(size, bold)) > max_w:
+        size -= 1
+    return size
 
 
 # ------------------------------------------------------------------ weather
@@ -124,13 +150,42 @@ def describe(code):
 
 
 # ------------------------------------------------------------------ icons
-# Flat, soft, filled shapes. Each icon is drawn 4x larger on a transparent
-# layer, then shrunk, which gives smooth (anti-aliased) edges.
+# Bold cartoon-style icons: flat ink colours with a black outline. Each icon is
+# drawn 4x larger on a transparent layer, then shrunk by taking the most common
+# colour in each 4x4 block (so edges stay smooth but no blended colours appear).
 SS = 4
+
+
+def _shrink(layer, ss):
+    w, h = layer.size[0] // ss, layer.size[1] // ss
+    src = layer.load()
+    out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    dst = out.load()
+    for y in range(h):
+        for x in range(w):
+            counts = {}
+            for j in range(ss):
+                for i in range(ss):
+                    p = src[x * ss + i, y * ss + j]
+                    counts[p] = counts.get(p, 0) + 1
+            best = max(counts, key=counts.get)
+            if best[3]:
+                dst[x, y] = best
+    return out
+
+
+def _ow(s):
+    """Outline width for an icon of size s (in layer pixels)."""
+    return max(1.6 * SS, .05 * s)
 
 
 def _circle(d, x, y, r, fill):
     d.ellipse([x - r, y - r, x + r, y + r], fill=fill)
+
+
+def _disc(d, x, y, r, fill, ow):
+    _circle(d, x, y, r + ow, BLACK)
+    _circle(d, x, y, r, fill)
 
 
 def _cloud(d, cx, cy, s, fill, grow=0):
@@ -140,68 +195,88 @@ def _cloud(d, cx, cy, s, fill, grow=0):
     d.rectangle([cx - .30 * s, cy - .02 * s, cx + .36 * s, cy + .33 * s + grow], fill=fill)
 
 
+def _cloud_o(d, cx, cy, s, fill):
+    _cloud(d, cx, cy, s, BLACK, grow=_ow(s))
+    _cloud(d, cx, cy, s, fill)
+
+
 def _cloud_pair(d, cx, cy, s):
-    # darker cloud peeking out behind a lighter one, each with a white gap
-    for (x, y, sz, col) in ((cx - .32 * s, cy - .30 * s, .82 * s, CLOUD_BACK),
-                            (cx + .04 * s, cy + .04 * s, s, CLOUD_FRONT)):
-        _cloud(d, x, y, sz, WHITE, grow=.05 * s)
-        _cloud(d, x, y, sz, col)
+    _cloud_o(d, cx - .32 * s, cy - .30 * s, .82 * s, BLUE)   # darker cloud behind
+    _cloud_o(d, cx + .04 * s, cy + .04 * s, s, WHITE)         # white cloud in front
 
 
 def _sun(d, cx, cy, s):
-    _circle(d, cx, cy, .5 * s, SUN)
+    r = .42 * s
+    for k in range(8):
+        a = k * math.pi / 4
+        d.line([(cx + math.cos(a) * (r + .2 * s), cy + math.sin(a) * (r + .2 * s)),
+                (cx + math.cos(a) * (r + .45 * s), cy + math.sin(a) * (r + .45 * s))],
+               fill=BLACK, width=int(max(2 * SS, .07 * s)))
+    _disc(d, cx, cy, r, ORANGE, _ow(s))
 
 
 def _drop(d, x, y, r):
-    d.polygon([(x, y - 2.1 * r), (x - .92 * r, y - .45 * r), (x + .92 * r, y - .45 * r)], fill=RAIN)
-    _circle(d, x, y, r, RAIN)
+    d.polygon([(x, y - 2.1 * r), (x - .92 * r, y - .45 * r), (x + .92 * r, y - .45 * r)], fill=BLUE)
+    _circle(d, x, y, r, BLUE)
 
 
 def _icon_fn(code, night=False):
-    def clear(d, cx, cy, s):
-        if night:
-            _circle(d, cx, cy, .5 * s, SUN)
-            _circle(d, cx + .26 * s, cy - .14 * s, .42 * s, WHITE)
-        else:
+    def clear(layer, d, cx, cy, s):
+        if not night:
             _sun(d, cx, cy, s)
+            return
+        # crescent moon with an outline all the way round
+        w, h = layer.size
+        r, rc, ow = .5 * s, .42 * s, _ow(s)
+        ccx, ccy = cx + .26 * s, cy - .14 * s
 
-    def part(d, cx, cy, s):
+        def disc(x, y, rad):
+            m = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(m).ellipse([x - rad, y - rad, x + rad, y + rad], fill=255)
+            return m
+        black = ImageChops.subtract(disc(cx, cy, r + ow), disc(ccx, ccy, rc))
+        yellow = ImageChops.subtract(disc(cx, cy, r), disc(ccx, ccy, rc + ow))
+        layer.paste(BLACK + (255,), (0, 0, w, h), black)
+        layer.paste(YELLOW + (255,), (0, 0, w, h), yellow)
+
+    def part(layer, d, cx, cy, s):
         _sun(d, cx + .24 * s, cy - .26 * s, .8 * s)
-        _cloud(d, cx - .06 * s, cy + .14 * s, .92 * s, WHITE, grow=.05 * s)
-        _cloud(d, cx - .06 * s, cy + .14 * s, .92 * s, CLOUD_FRONT)
+        _cloud_o(d, cx - .06 * s, cy + .14 * s, .92 * s, WHITE)
 
-    def overcast(d, cx, cy, s):
+    def overcast(layer, d, cx, cy, s):
         _cloud_pair(d, cx, cy + .12 * s, s)
 
-    def fog(d, cx, cy, s):
-        h = .12 * s
+    def fog(layer, d, cx, cy, s):
+        h = .14 * s
         for i in range(4):
             y = cy - .36 * s + i * .26 * s
             x = cx - .5 * s + (i % 2) * .12 * s
-            d.rounded_rectangle([x, y, x + .8 * s, y + h], radius=h / 2, fill=CLOUD_BACK)
+            d.rounded_rectangle([x, y, x + .8 * s, y + h], radius=h / 2, fill=BLUE)
 
     def rain(heavy):
-        def f(d, cx, cy, s):
+        def f(layer, d, cx, cy, s):
             _cloud_pair(d, cx, cy - .14 * s, s)
-            r = .065 * s
+            r = max(.085 * s, 2.2 * SS)
             for row in range(3 if heavy else 2):
                 n = 4 if row % 2 == 0 else 3
                 for i in range(n):
                     x = cx - .34 * s + i * (.68 * s / 3) + (row % 2) * .11 * s
-                    _drop(d, x, cy + .50 * s + row * .22 * s, r)
+                    _drop(d, x, cy + .52 * s + row * .24 * s, r)
         return f
 
-    def snow(d, cx, cy, s):
+    def snow(layer, d, cx, cy, s):
         _cloud_pair(d, cx, cy - .14 * s, s)
         for row in range(2):
             for i in range(4 - row):
                 x = cx - .34 * s + i * (.68 * s / 3) + row * .11 * s
-                _circle(d, x, cy + .52 * s + row * .22 * s, .06 * s, RAIN)
+                _circle(d, x, cy + .54 * s + row * .24 * s, max(.08 * s, 2.2 * SS), BLUE)
 
-    def thunder(d, cx, cy, s):
+    def thunder(layer, d, cx, cy, s):
         _cloud_pair(d, cx, cy - .14 * s, s)
-        pts = [(.05, .26), (-.17, .60), (-.02, .58), (-.10, .92), (.20, .50), (.04, .52)]
-        d.polygon([(cx + a * s, cy + b * s) for a, b in pts], fill=BOLT)
+        pts = [(cx + a * s, cy + b * s) for a, b in
+               [(.05, .26), (-.17, .60), (-.02, .58), (-.10, .92), (.20, .50), (.04, .52)]]
+        d.polygon(pts, fill=YELLOW)
+        d.line(pts + [pts[0]], fill=BLACK, width=int(max(1.5 * SS, .04 * s)), joint="curve")
 
     if code in (0, 1):
         return clear
@@ -223,9 +298,9 @@ def _icon_fn(code, night=False):
 def draw_icon(img, code, cx, cy, s, night=False):
     box = int(s * 2.4)
     layer = Image.new("RGBA", (box * SS, box * SS), (0, 0, 0, 0))
-    _icon_fn(code, night)(ImageDraw.Draw(layer), box * SS / 2, box * SS / 2, s * SS)
-    layer = layer.resize((box, box), Image.LANCZOS)
-    img.paste(layer, (int(cx - box / 2), int(cy - box / 2)), layer)
+    _icon_fn(code, night)(layer, ImageDraw.Draw(layer), box * SS / 2, box * SS / 2, s * SS)
+    small = _shrink(layer, SS)
+    img.paste(small, (int(cx - box / 2), int(cy - box / 2)), small)
 
 
 # ------------------------------------------------------------------ moon
@@ -247,21 +322,24 @@ def moon_name(p):
 
 
 def draw_moon(img, cx, cy, r, p):
-    """Phase as seen from the northern hemisphere: waxing = right side lit."""
+    """Phase as seen from the northern hemisphere: waxing = right side lit.
+    Drawn on a black panel: white rim, black unlit side, yellow lit side."""
     n = int(r * 2 + 8)
     layer = Image.new("RGBA", (n * SS, n * SS), (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
     c, R = n * SS / 2, r * SS
-    _circle(d, c, c, R, MOON_DARK)
+    R2 = R - 3 * SS
+    _circle(d, c, c, R, WHITE)
+    _circle(d, c, c, R2, BLACK)
     k = math.cos(2 * math.pi * p)
-    for dy in range(-int(R), int(R) + 1):
-        w = math.sqrt(max(0.0, R * R - dy * dy))
+    for dy in range(-int(R2), int(R2) + 1):
+        w = math.sqrt(max(0.0, R2 * R2 - dy * dy))
         t = w * k
         x0, x1 = (t, w) if p < 0.5 else (-w, -t)
         if x1 > x0:
-            d.line([(c + x0, c + dy), (c + x1, c + dy)], fill=MOON_LIT)
-    layer = layer.resize((n, n), Image.LANCZOS)
-    img.paste(layer, (int(cx - n / 2), int(cy - n / 2)), layer)
+            d.line([(c + x0, c + dy), (c + x1, c + dy)], fill=YELLOW)
+    small = _shrink(layer, SS)
+    img.paste(small, (int(cx - n / 2), int(cy - n / 2)), small)
 
 
 # ------------------------------------------------------------------ tides
@@ -318,17 +396,10 @@ def find_extrema(series):
     return out
 
 
-def _fit_size(d, s, bold, max_w, start):
-    size = start
-    while size > 10 and d.textlength(s, font=font(size, bold)) > max_w:
-        size -= 1
-    return size
-
-
 def draw_tides(img, d, box, series, now):
     x0, y0, x1, y1 = box
-    d.rounded_rectangle(box, radius=10, outline=BLACK, width=2)
-    d.text((x0 + 14, y0 + 6), "TIDES TODAY", font=font(13, True), fill=GREY)
+    d.rounded_rectangle(box, radius=10, outline=BLACK, width=3)
+    d.text((x0 + 16, y0 + 9), "TIDES TODAY", font=font(16, True), fill=BLACK)
     midnight = datetime.datetime.combine(now.date(), datetime.time(), tzinfo=TZ)
     pts = []
     for t, v in series or []:
@@ -336,11 +407,11 @@ def draw_tides(img, d, box, series, now):
         if -1.5 <= hrs <= 25.5:
             pts.append((hrs, v))
     if len(pts) < 6:
-        d.text((x0 + 14, y0 + 56), "Tide data unavailable", font=font(18), fill=GREY)
+        d.text((x0 + 16, y0 + 70), "Tide data unavailable", font=font(20, True), fill=BLACK)
         return
 
     curve = [(h, v) for h, v in _curve(pts) if 0 <= h <= 24]
-    px0, px1, py0, py1 = x0 + 18, x1 - 18, y0 + 52, y1 - 50
+    px0, px1, py0, py1 = x0 + 20, x1 - 20, y0 + 58, y1 - 62
     vmin, vmax = min(v for _, v in curve), max(v for _, v in curve)
     span = max(vmax - vmin, 0.5)
 
@@ -353,64 +424,85 @@ def draw_tides(img, d, box, series, now):
     def at(h):  # curve value at hour h
         return min(curve, key=lambda p: abs(p[0] - h))[1]
 
-    # smooth filled curve, drawn 4x larger then shrunk for clean edges
-    pad = 8
+    # Curve with a hatched (striped) fill. Drawn 4x larger, then shrunk by colour vote.
+    pad = 10
     lw, lh = (px1 - px0) + 2 * pad, (py1 - py0) + 2 * pad
-    layer = Image.new("RGBA", (lw * SS, lh * SS), (0, 0, 0, 0))
+    size = (lw * SS, lh * SS)
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
     ld = ImageDraw.Draw(layer)
 
     def L(x, y):
         return ((x - px0 + pad) * SS, (y - py0 + pad) * SS)
 
     line = [L(X(h), Y(v)) for h, v in curve]
-    ld.polygon(line + [L(X(24), py1), L(X(0), py1)], fill=TIDE_FILL)
-    ld.line(line, fill=BLUE, width=3 * SS, joint="curve")
+    poly = Image.new("L", size, 0)
+    ImageDraw.Draw(poly).polygon(line + [L(X(24), py1), L(X(0), py1)], fill=255)
+    hatch = Image.new("L", size, 0)
+    hd = ImageDraw.Draw(hatch)
+    for sx in range(0, size[0], 6 * SS):
+        hd.rectangle([sx, 0, sx + 2 * SS - 1, size[1]], fill=255)
+    layer.paste(BLUE + (255,), (0, 0) + size, ImageChops.darker(poly, hatch))
+    ld.line(line, fill=BLUE, width=5 * SS, joint="curve")
     extrema = [(t, k) for t, k in find_extrema(series)
                if 0 <= (t - midnight).total_seconds() / 3600.0 <= 24]
     for t, k in extrema:
         h = (t - midnight).total_seconds() / 3600.0
         cx, cy = L(X(h), Y(at(h)))
-        ld.ellipse([cx - 4 * SS, cy - 4 * SS, cx + 4 * SS, cy + 4 * SS], fill=BLUE)
-    layer = layer.resize((lw, lh), Image.LANCZOS)
-    img.paste(layer, (px0 - pad, py0 - pad), layer)
+        _circle(ld, cx, cy, 6 * SS, BLACK)
+    small = _shrink(layer, SS)
+    img.paste(small, (px0 - pad, py0 - pad), small)
 
     # axis, ticks and hour labels
-    d.line([(px0, py1 + 1), (px1, py1 + 1)], fill=GREY, width=1)
+    d.line([(px0, py1 + 3), (px1, py1 + 3)], fill=BLACK, width=2)
     for hr in (0, 6, 12, 18, 24):
-        d.line([(X(hr), py1 + 1), (X(hr), py1 + 5)], fill=GREY, width=1)
-        d.text((X(hr), y1 - 22), "%02d" % (hr % 24), font=font(12), fill=GREY, anchor="ma")
+        d.line([(X(hr), py1 + 3), (X(hr), py1 + 9)], fill=BLACK, width=2)
+        d.text((X(hr), y1 - 27), "%02d" % (hr % 24), font=font(15, True), fill=BLACK, anchor="ma")
 
     # high / low tide times
     for t, k in extrema:
         h = (t - midnight).total_seconds() / 3600.0
-        cx = min(max(X(h), px0 + 16), px1 - 16)
-        y = Y(at(h)) - 20 if k == "H" else Y(at(h)) + 6
-        d.text((cx, y), t.strftime("%H:%M"), font=font(12, True), fill=BLACK, anchor="ma")
+        cx = min(max(X(h), px0 + 22), px1 - 22)
+        y = Y(at(h)) - 26 if k == "H" else Y(at(h)) + 9
+        d.text((cx, y), t.strftime("%H:%M"), font=font(16, True), fill=BLACK, anchor="ma")
 
     # "now" marker
     hn = (now - midnight).total_seconds() / 3600.0
     if 0 <= hn <= 24:
-        for yy in range(py0 - 4, py1 + 2, 6):
-            d.line([(X(hn), yy), (X(hn), yy + 3)], fill=RED, width=2)
+        for yy in range(py0 - 8, py1 + 3, 9):
+            d.line([(X(hn), yy), (X(hn), yy + 5)], fill=RED, width=3)
         cx, cy = X(hn), Y(at(hn))
-        d.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=WHITE)
-        d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=RED)
+        d.ellipse([cx - 9, cy - 9, cx + 9, cy + 9], fill=BLACK)
+        d.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=RED)
 
 
 def _sun_glyph(d, cx, cy, rising):
     """Small half-sun on a horizon line with an up/down arrow."""
-    d.pieslice([cx - 13, cy - 13, cx + 13, cy + 13], 180, 360, fill=SUN)
-    d.line([(cx - 20, cy + 1), (cx + 20, cy + 1)], fill=BLACK, width=2)
+    d.pieslice([cx - 15, cy - 15, cx + 15, cy + 15], 180, 360, fill=ORANGE, outline=BLACK, width=2)
+    d.line([(cx - 22, cy + 1), (cx + 22, cy + 1)], fill=BLACK, width=3)
     if rising:
-        d.polygon([(cx, cy - 25), (cx - 6, cy - 16), (cx + 6, cy - 16)], fill=ORANGE_DARK)
+        tri = [(cx, cy - 31), (cx - 8, cy - 19), (cx + 8, cy - 19)]
     else:
-        d.polygon([(cx, cy - 16), (cx - 6, cy - 25), (cx + 6, cy - 25)], fill=ORANGE_DARK)
+        tri = [(cx, cy - 19), (cx - 8, cy - 31), (cx + 8, cy - 31)]
+    d.polygon(tri, fill=RED, outline=BLACK)
+
+
+# ------------------------------------------------------------------ image output
+def _palette_image(colours):
+    flat = [c for rgb in colours for c in rgb]
+    p = Image.new("P", (1, 1))
+    p.putpalette(flat + list(colours[0]) * (256 - len(colours)))
+    return p
+
+
+def snap_to_inks(img):
+    """Force every pixel to the nearest of the seven inks (no dithering)."""
+    return img.quantize(palette=_palette_image(INKS), dither=Image.Dither.NONE)
 
 
 # ------------------------------------------------------------------ drawing
-def generate_image(weather, tides, now, out_path=OUTPUT_PATH):
+def generate_image(weather, tides, now, out_path=OUTPUT_PATH, preview_path=None):
     img = Image.new("RGB", (W, H), WHITE)
-    d = ImageDraw.Draw(img)
+    d = PixelDraw(img)
 
     cur, daily = weather["current"], weather["daily"]
     sunrise = datetime.datetime.fromisoformat(daily["sunrise"][0]).replace(tzinfo=TZ)
@@ -418,8 +510,8 @@ def generate_image(weather, tides, now, out_path=OUTPUT_PATH):
     is_night = now >= sunset or now < sunrise
 
     # layout lines
-    d.rectangle([320, 0, 321, H], fill=BLACK)
-    d.rectangle([322, 300, W, 301], fill=BLACK)
+    d.rectangle([320, 0, 322, H], fill=BLACK)
+    d.rectangle([323, 300, W, 302], fill=BLACK)
 
     # date
     date_s = now.strftime("%A, %d %b")
@@ -427,35 +519,39 @@ def generate_image(weather, tides, now, out_path=OUTPUT_PATH):
 
     # current weather (large)
     code = cur["weather_code"]
-    draw_icon(img, code, 80, 122, 68, night=is_night)
+    draw_icon(img, code, 80, 122, 62, night=is_night)
     temp_s = "%d°C" % round(cur["temperature_2m"])
     d.text((152, 56), temp_s, font=font(_fit_size(d, temp_s, True, 160, 78), True), fill=BLACK)
-    d.text((154, 150), fit(d, describe(code), font(22), 160), font=font(22), fill=BLACK)
-    d.text((26, 192), "Feels %d°  ·  Humidity %d%%  ·  %d km/h" % (
-        round(cur["apparent_temperature"]), round(cur["relative_humidity_2m"]),
-        round(cur["wind_speed_10m"])), font=font(14), fill=GREY)
+    desc = describe(code)
+    d.text((154, 148), desc, font=font(_fit_size(d, desc, True, 158, 22), True), fill=BLACK)
+    d.text((26, 184), "Feels like %d°   Wind %d km/h" % (
+        round(cur["apparent_temperature"]), round(cur["wind_speed_10m"])),
+        font=font(16, True), fill=BLACK)
+    d.text((26, 206), "Humidity %d%%" % round(cur["relative_humidity_2m"]),
+           font=font(16, True), fill=BLACK)
 
     # sunrise / sunset
-    _sun_glyph(d, 44, 256, True)
-    d.text((82, 228), "Sunrise", font=font(12), fill=GREY)
-    d.text((82, 244), sunrise.strftime("%H:%M"), font=font(24, True), fill=BLACK)
-    _sun_glyph(d, 188, 256, False)
-    d.text((226, 228), "Sunset", font=font(12), fill=GREY)
-    d.text((226, 244), sunset.strftime("%H:%M"), font=font(24, True), fill=BLACK)
+    _sun_glyph(d, 38, 268, True)
+    d.text((72, 240), "Sunrise", font=font(15, True), fill=BLACK)
+    d.text((72, 258), sunrise.strftime("%H:%M"), font=font(24, True), fill=BLACK)
+    _sun_glyph(d, 182, 268, False)
+    d.text((216, 240), "Sunset", font=font(15, True), fill=BLACK)
+    d.text((216, 258), sunset.strftime("%H:%M"), font=font(24, True), fill=BLACK)
 
     # bottom-left panel: moon after sunset, next tides by day
-    d.rounded_rectangle([12, 312, 308, 470], radius=14,
-                        fill=MOON_BG if is_night else WHITE, outline=BLACK, width=2)
     if is_night:
+        d.rounded_rectangle([12, 312, 308, 470], radius=14, fill=BLACK, outline=BLACK, width=3)
         p = moon_phase(now)
         draw_moon(img, 82, 391, 54, p)
         words = moon_name(p).split(" ")
         for i, wtxt in enumerate(words):
             d.text((158, 346 + i * 28), wtxt, font=font(22, True), fill=WHITE)
         illum = (1 - math.cos(2 * math.pi * p)) / 2 * 100
-        d.text((158, 346 + len(words) * 28 + 6), "%d%% lit" % round(illum), font=font(16), fill=MOON_LIT)
+        d.text((158, 346 + len(words) * 28 + 6), "%d%% lit" % round(illum),
+               font=font(17, True), fill=YELLOW)
     else:
-        d.text((28, 324), "NEXT TIDES", font=font(13, True), fill=GREY)
+        d.rounded_rectangle([12, 312, 308, 470], radius=14, fill=WHITE, outline=BLACK, width=3)
+        d.text((28, 324), "NEXT TIDES", font=font(16, True), fill=BLACK)
         nxt = {}
         for t, k in find_extrema(tides or []):
             if t > now and k not in nxt:
@@ -464,13 +560,14 @@ def generate_image(weather, tides, now, out_path=OUTPUT_PATH):
             for i, (k, t) in enumerate(sorted(nxt.items(), key=lambda kv: kv[1])):
                 name = "High" if k == "H" else "Low"
                 y = 358 + i * 50
-                tri = [(44, y + 4), (34, y + 22), (54, y + 22)] if k == "H" else \
-                      [(44, y + 22), (34, y + 4), (54, y + 4)]
+                tri = [(44, y + 4), (33, y + 24), (55, y + 24)] if k == "H" else \
+                      [(44, y + 24), (33, y + 4), (55, y + 4)]
                 d.polygon(tri, fill=BLUE)
                 day = "" if t.date() == now.date() else " " + t.strftime("%a")
-                d.text((72, y), "%s %s%s" % (name, t.strftime("%H:%M"), day), font=font(22, True), fill=BLACK)
+                d.text((72, y), "%s %s%s" % (name, t.strftime("%H:%M"), day),
+                       font=font(22, True), fill=BLACK)
         else:
-            d.text((28, 370), "Tide data unavailable", font=font(18), fill=GREY)
+            d.text((28, 370), "Tide data unavailable", font=font(18, True), fill=BLACK)
 
     # tide chart (top right)
     draw_tides(img, d, (334, 10, 786, 292), tides, now)
@@ -479,20 +576,26 @@ def generate_image(weather, tides, now, out_path=OUTPUT_PATH):
     for i in range(5):
         x0 = 332 + i * 94
         cx = x0 + 44
-        d.rounded_rectangle([x0, 310, x0 + 88, 470], radius=10, outline=BLACK, width=2)
+        d.rounded_rectangle([x0, 312, x0 + 88, 470], radius=10, outline=BLACK, width=3)
         day = datetime.date.fromisoformat(daily["time"][i])
         label = "Today" if i == 0 else day.strftime("%a")
-        d.text((cx, 318), label, font=font(16, True), fill=BLUE, anchor="ma")
-        draw_icon(img, daily["weather_code"][i], cx + 2, 372, 28)
+        d.text((cx, 319), label, font=font(17, True), fill=BLUE, anchor="ma")
+        draw_icon(img, daily["weather_code"][i], cx + 2, 372, 27)
         hi, lo = daily["temperature_2m_max"][i], daily["temperature_2m_min"][i]
-        d.text((cx, 414), "%d°/%d°" % (round(hi), round(lo)), font=font(17, True),
+        d.text((cx, 413), "%d°/%d°" % (round(hi), round(lo)), font=font(18, True),
                fill=RED if hi >= 25 else BLACK, anchor="ma")
         pp = daily["precipitation_probability_max"][i]
         if pp is not None:
-            d.text((cx, 440), "%d%%" % pp, font=font(14), fill=RAIN, anchor="ma")
+            d.text((cx, 439), "%d%%" % pp, font=font(16, True), fill=BLUE, anchor="ma")
 
-    # baseline (not progressive) JPEG: what the Inky Frame's decoder expects
-    img.save(out_path, "JPEG", quality=90, subsampling=0, optimize=False, progressive=False)
+    # Snap to the seven inks. Save as a baseline JPEG (what the Inky Frame's decoder wants).
+    snapped = snap_to_inks(img)
+    snapped.convert("RGB").save(out_path, "JPEG", quality=95, subsampling=0,
+                                optimize=False, progressive=False)
+    if preview_path:  # what it should roughly look like on the muted panel inks
+        look = snapped.copy()
+        look.putpalette([c for rgb in PANEL_LOOK for c in rgb] + list(PANEL_LOOK[0]) * (256 - 7))
+        look.convert("RGB").save(preview_path)
 
 
 def main():
