@@ -439,7 +439,7 @@ def draw_tides(img, d, box, series, now):
     ImageDraw.Draw(poly).polygon(line + [L(X(24), py1), L(X(0), py1)], fill=255)
     hatch = Image.new("L", size, 0)
     hd = ImageDraw.Draw(hatch)
-    for sx in range(0, size[0], 6 * SS):
+    for sx in range(0, size[0], 9 * SS):
         hd.rectangle([sx, 0, sx + 2 * SS - 1, size[1]], fill=255)
     layer.paste(BLUE + (255,), (0, 0) + size, ImageChops.darker(poly, hatch))
     ld.line(line, fill=BLUE, width=5 * SS, joint="curve")
@@ -463,7 +463,10 @@ def draw_tides(img, d, box, series, now):
         h = (t - midnight).total_seconds() / 3600.0
         cx = min(max(X(h), px0 + 22), px1 - 22)
         y = Y(at(h)) - 26 if k == "H" else Y(at(h)) + 9
-        d.text((cx, y), t.strftime("%H:%M"), font=font(16, True), fill=BLACK, anchor="ma")
+        label, f = t.strftime("%H:%M"), font(16, True)
+        l, tp, r, bt = d.textbbox((cx, y), label, font=f, anchor="ma")
+        d.rectangle([l - 4, tp - 2, r + 4, bt + 3], fill=WHITE)   # keeps stripes from crossing the text
+        d.text((cx, y), label, font=f, fill=BLACK, anchor="ma")
 
     # "now" marker
     hn = (now - midnight).total_seconds() / 3600.0
@@ -519,11 +522,11 @@ def generate_image(weather, tides, now, out_path=OUTPUT_PATH, preview_path=None)
 
     # current weather (large)
     code = cur["weather_code"]
-    draw_icon(img, code, 80, 122, 62, night=is_night)
+    draw_icon(img, code, 82, 124, 68, night=is_night)
     temp_s = "%d°C" % round(cur["temperature_2m"])
     d.text((152, 56), temp_s, font=font(_fit_size(d, temp_s, True, 160, 78), True), fill=BLACK)
     desc = describe(code)
-    d.text((154, 148), desc, font=font(_fit_size(d, desc, True, 158, 22), True), fill=BLACK)
+    d.text((154, 148), desc, font=font(_fit_size(d, desc, True, 158, 24), True), fill=BLACK)
     d.text((26, 184), "Feels like %d°   Wind %d km/h" % (
         round(cur["apparent_temperature"]), round(cur["wind_speed_10m"])),
         font=font(16, True), fill=BLACK)
@@ -580,7 +583,7 @@ def generate_image(weather, tides, now, out_path=OUTPUT_PATH, preview_path=None)
         day = datetime.date.fromisoformat(daily["time"][i])
         label = "Today" if i == 0 else day.strftime("%a")
         d.text((cx, 319), label, font=font(17, True), fill=BLUE, anchor="ma")
-        draw_icon(img, daily["weather_code"][i], cx + 2, 372, 27)
+        draw_icon(img, daily["weather_code"][i], cx + 2, 374, 31)
         hi, lo = daily["temperature_2m_max"][i], daily["temperature_2m_min"][i]
         d.text((cx, 413), "%d°/%d°" % (round(hi), round(lo)), font=font(18, True),
                fill=RED if hi >= 25 else BLACK, anchor="ma")
