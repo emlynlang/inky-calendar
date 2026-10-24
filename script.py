@@ -6,6 +6,11 @@ HOW IT FITS TOGETHER
     and saves it as dashboard.jpg in the repo. The Inky Frame then downloads that
     picture and shows it (see the Pico's main.py).
 
+    The red "you are here" marker on the tide chart is NOT part of the picture.
+    GitHub can be hours late, so a marker baked into the picture could be hours
+    out. Instead this script also writes dashboard.json, which describes where the
+    tide curve is on screen, and the Pico draws the marker itself using its own clock.
+
 WHY THE PICTURE LOOKS THE WAY IT DOES
     The e-ink panel can only print seven pure inks: black, white, green, blue,
     red, yellow and orange. Anything else (greys, pastels, soft edges) turns into
@@ -28,6 +33,7 @@ FILE LAYOUT (top to bottom)
     3. Fonts and text drawing    6. Drawing the dashboard, then main()
 """
 import datetime
+import json
 import math
 import os
 from zoneinfo import ZoneInfo
@@ -49,6 +55,7 @@ TIDE_LAT = (os.environ.get("TIDE_LATITUDE") or "54.33").strip()
 TIDE_LON = (os.environ.get("TIDE_LONGITUDE") or "-8.85").strip()
 
 OUTPUT_PATH = "dashboard.jpg"
+SIDECAR_PATH = "dashboard.json"   # tells the Pico where the tide curve is (see header)
 W, H = 800, 480  # the Inky Frame 7.3" screen size in pixels
 
 # The seven inks. The values are deliberately far apart from each other so the
@@ -592,8 +599,11 @@ def _draw_next_tides_panel(d, tides, now):
 def _draw_tide_chart(img, d, series, now):
     """Today's tide as a smooth curve from midnight to midnight.
 
-    Marked on it: high/low tide times (black dots with labels), hour labels
-    along the bottom, and a red dashed line + dot for "now".
+    Marked on it: high/low tide times (black dots with labels) and hour labels
+    along the bottom. The red "now" marker is left for the Pico to draw.
+
+    Returns a small dict describing where the curve is on screen (for the Pico),
+    or None if there is no tide data.
     """
     x0, y0, x1, y1 = TIDE_BOX
     d.rounded_rectangle(TIDE_BOX, radius=10, outline=BLACK, width=3)
@@ -608,7 +618,7 @@ def _draw_tide_chart(img, d, series, now):
     pts = [(hours(t), v) for t, v in series or [] if -1.5 <= hours(t) <= 25.5]
     if len(pts) < 6:
         d.text((x0 + 16, y0 + 70), "Tide data unavailable", font=font(20, True), fill=BLACK)
-        return
+        return None
 
     curve = [(h, v) for h, v in _smooth_curve(pts) if 0 <= h <= 24]
 
@@ -669,14 +679,25 @@ def _draw_tide_chart(img, d, series, now):
         d.rectangle([l - 4, top - 2, r + 4, bottom + 3], fill=WHITE)   # white patch so stripes don't cross the text
         d.text((cx, y), label, font=f, fill=BLACK, anchor="ma")
 
-    # --- "Now" marker: red dashed vertical line with a dot on the curve ------
-    now_h = hours(now)
-    if 0 <= now_h <= 24:
-        for yy in range(py0 - 8, py1 + 3, 9):
-            d.line([(X(now_h), yy), (X(now_h), yy + 5)], fill=RED, width=3)
-        cx, cy = X(now_h), Y(height_at(now_h))
-        d.ellipse([cx - 9, cy - 9, cx + 9, cy + 9], fill=BLACK)
-        d.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=RED)
+    # --- Describe the chart so the Pico can draw the "now" marker -----------------
+    # x runs linearly from x0 (midnight) to x1 (next midnight); ys holds the y pixel
+    # of the curve for every 10 minutes of the day (145 values: 00:00, 00:10 ... 24:00).
+    return {
+        "x0": px0, "x1": px1,
+        "top": py0 - 8, "bottom": py1 + 3,          # extent of the dashed line
+        "ys": [int(round(Y(height_at(i / 6.0)))) for i in range(145)],
+    }
+
+
+def _draw_now_marker(d, marker, now_h):
+    """Red dashed line and dot for the current time. The Pico draws the real one on
+    the frame; this copy is only used for the preview picture."""
+    x = marker["x0"] + now_h / 24.0 * (marker["x1"] - marker["x0"])
+    for yy in range(marker["top"], marker["bottom"], 9):
+        d.line([(x, yy), (x, yy + 5)], fill=RED, width=3)
+    y = marker["ys"][int(round(now_h * 6))]
+    d.ellipse([x - 9, y - 9, x + 9, y + 9], fill=BLACK)
+    d.ellipse([x - 6, y - 6, x + 6, y + 6], fill=RED)
 
 
 def _draw_forecast(img, d, daily):
@@ -715,7 +736,8 @@ def snap_to_inks(img):
     return img.quantize(palette=_palette_image(INKS), dither=Image.Dither.NONE)
 
 
-def generate_image(weather, tides, now, out_path=OUTPUT_PATH, preview_path=None):
+def generate_image(weather, tides, now, out_path=OUTPUT_PATH, preview_path=None,
+                   sidecar_path=SIDECAR_PATH):
     """Draw the whole dashboard and save it.
 
     weather -- the dict from get_weather()
@@ -723,7 +745,9 @@ def generate_image(weather, tides, now, out_path=OUTPUT_PATH, preview_path=None)
     now     -- the current time (timezone-aware)
     out_path -- where the real picture for the frame is saved (JPEG)
     preview_path -- optional: also save a PNG showing roughly how it will look
-                    in the panel's muted colours (handy for checking on a computer)
+                    in the panel's muted colours (handy for checking on a computer),
+                    including the "now" marker the Pico would add
+    sidecar_path -- where to save dashboard.json (the tide-curve description)
     """
     img = Image.new("RGB", (W, H), WHITE)
     d = PixelDraw(img)
@@ -744,7 +768,7 @@ def generate_image(weather, tides, now, out_path=OUTPUT_PATH, preview_path=None)
         _draw_moon_panel(img, d, now)          # after sunset: the moon phase
     else:
         _draw_next_tides_panel(d, tides, now)  # by day: the next high and low tide
-    _draw_tide_chart(img, d, tides, now)
+    marker = _draw_tide_chart(img, d, tides, now)
     _draw_forecast(img, d, daily)
 
     # Snap every pixel to an ink and save as a baseline (non-progressive) JPEG,
@@ -752,8 +776,18 @@ def generate_image(weather, tides, now, out_path=OUTPUT_PATH, preview_path=None)
     snapped = snap_to_inks(img)
     snapped.convert("RGB").save(out_path, "JPEG", quality=95, subsampling=0,
                                 optimize=False, progressive=False)
+    # The sidecar file: which day the tide curve is for, and where it is on screen.
+    with open(sidecar_path, "w") as f:
+        json.dump({"date": now.date().isoformat(),
+                   "rendered": now.isoformat(timespec="minutes"),
+                   "marker": marker}, f, separators=(",", ":"))
+
     if preview_path:
-        look = snapped.copy()
+        shown = snapped.convert("RGB")
+        if marker:
+            midnight = datetime.datetime.combine(now.date(), datetime.time(), tzinfo=TZ)
+            _draw_now_marker(PixelDraw(shown), marker, (now - midnight).total_seconds() / 3600.0)
+        look = snap_to_inks(shown)
         look.putpalette([c for rgb in PANEL_LOOK for c in rgb] + list(PANEL_LOOK[0]) * (256 - 7))
         look.convert("RGB").save(preview_path)
 
@@ -771,4 +805,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
