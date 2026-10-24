@@ -46,11 +46,20 @@ jobs:
           LONGITUDE: ${{ secrets.LONGITUDE }}
         run: python script.py
 
-      - name: Commit and push the updated dashboard files
+      # Publish the two files to a branch called "dashboard". Each time, a brand-new
+      # one-commit history is created and force-pushed over the old one, so the repo
+      # never fills up with hundreds of old pictures. The main branch stays for code only.
+      - name: Publish the dashboard files to the "dashboard" branch
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config --global user.name "GitHub Action Server"
           git config --global user.email "action@github.com"
+          PUBLISH_DIR="$(mktemp -d)"
+          cp dashboard.jpg dashboard.json "$PUBLISH_DIR/"
+          cd "$PUBLISH_DIR"
+          git init -q -b dashboard
           git add dashboard.jpg dashboard.json
-          git commit -m "Automated update of dashboard image" || exit 0
-          git pull --rebase --autostash origin main
-          git push
+          git commit -q -m "Dashboard picture"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push --force origin dashboard
