@@ -35,9 +35,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Download Custom TrueType Fonts
-        run: |
-          chmod +x get_fonts.sh
-          ./get_fonts.sh
+        # "bash get_fonts.sh" runs the script without changing its file permissions.
+        # (The old "chmod +x" made git think the file had been edited, which blocked the
+        # "git pull --rebase" step below.)
+        run: bash get_fonts.sh
 
       - name: Run generation script with Secrets injected
         env:
@@ -51,5 +52,5 @@ jobs:
           git config --global user.email "action@github.com"
           git add dashboard.jpg dashboard.json
           git commit -m "Automated update of dashboard image" || exit 0
-          git pull --rebase origin main
+          git pull --rebase --autostash origin main
           git push
