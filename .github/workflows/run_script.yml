@@ -1,19 +1,25 @@
 name: Generate E-Ink Dashboard
 
 on:
+  # MAIN TRIGGER: cron-job.org calls GitHub every 30 minutes and starts this workflow
+  # (that is the "workflow_dispatch" below). GitHub's own scheduler is unreliable
+  # (it can run hours late), so the schedule here is only an hourly back-up.
+  workflow_dispatch:
   schedule:
-    # Triggers every 30 minutes on the dot
-    - cron: '0,30 * * * *'
-  workflow_dispatch: # Keeps a manual trigger button active in your Actions tab
+    - cron: '17 * * * *'
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
+
+# Never run two updates at the same time (they would clash when saving the picture).
+concurrency:
+  group: dashboard
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v4
@@ -27,7 +33,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          
+
       - name: Download Custom TrueType Fonts
         run: |
           chmod +x get_fonts.sh
@@ -35,16 +41,15 @@ jobs:
 
       - name: Run generation script with Secrets injected
         env:
-          CALENDAR_URL: ${{ secrets.CALENDAR_URL }}
           LATITUDE: ${{ secrets.LATITUDE }}
           LONGITUDE: ${{ secrets.LONGITUDE }}
-          WEATHER_API_KEY: ${{ secrets.WEATHER_API_KEY }}
         run: python script.py
 
-      - name: Commit and push the updated dashboard image
+      - name: Commit and push the updated dashboard files
         run: |
           git config --global user.name "GitHub Action Server"
           git config --global user.email "action@github.com"
-          git add dashboard.jpg
+          git add dashboard.jpg dashboard.json
           git commit -m "Automated update of dashboard image" || exit 0
+          git pull --rebase origin main
           git push
