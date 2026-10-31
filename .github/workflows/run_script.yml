@@ -45,6 +45,10 @@ jobs:
         env:
           LATITUDE: ${{ secrets.LATITUDE }}
           LONGITUDE: ${{ secrets.LONGITUDE }}
+          # Optional extras: leave these secrets unset and script.py uses its built-in defaults.
+          TIMEZONE: ${{ secrets.TIMEZONE }}
+          TIDE_LATITUDE: ${{ secrets.TIDE_LATITUDE }}
+          TIDE_LONGITUDE: ${{ secrets.TIDE_LONGITUDE }}
         run: python script.py
 
       # Publish the two files to a branch called "dashboard". Each time, a brand-new
