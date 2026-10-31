@@ -8,6 +8,7 @@ on:
   schedule:
     - cron: '17 * * * *'
 
+# Only what the publish step needs: permission to push the "dashboard" branch.
 permissions:
   contents: write
 
@@ -22,12 +23,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout repository code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
-          python-version: '3.10'
+          python-version: '3.13'
 
       - name: Install dependencies
         run: |
