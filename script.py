@@ -36,6 +36,7 @@ import datetime
 import json
 import math
 import os
+import time
 from zoneinfo import ZoneInfo
 
 import requests
@@ -179,9 +180,32 @@ def _fit_size(d, s, bold, max_w, start):
 # =============================================================================
 # 4. WEATHER AND TIDE DATA
 # =============================================================================
+def _fetch_json(url, params, tries=3):
+    """Download JSON from a web address, trying again if the server is slow or fails.
+
+    Open-Meteo is free and sometimes takes a moment to answer. One slow reply used
+    to make the whole update fail (and GitHub sent an email), so we now try up to
+    3 times, waiting a little longer between each try (5 seconds, then 10).
+    If every try fails, the last error is raised and the update stops, so the
+    previous good picture stays on the dashboard branch.
+    """
+    for attempt in range(1, tries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError) as e:
+            if attempt == tries:
+                raise
+            wait = 5 * attempt
+            print("Try %d of %d failed (%s). Trying again in %d seconds."
+                  % (attempt, tries, type(e).__name__, wait))
+            time.sleep(wait)
+
+
 def get_weather():
     """Current weather plus a 5-day forecast from Open-Meteo (free, no key)."""
-    r = requests.get(
+    return _fetch_json(
         "https://api.open-meteo.com/v1/forecast",
         params={
             "latitude": LAT,
@@ -194,10 +218,7 @@ def get_weather():
             "forecast_days": 5,
             "wind_speed_unit": "kmh",
         },
-        timeout=20,
     )
-    r.raise_for_status()
-    return r.json()
 
 
 def describe(code):
@@ -223,7 +244,7 @@ def get_tides():
     not from the "chart datum" used on printed tide tables, which is why the
     dashboard shows times but not heights.
     """
-    r = requests.get(
+    data = _fetch_json(
         "https://marine-api.open-meteo.com/v1/marine",
         params={
             "latitude": TIDE_LAT,
@@ -232,10 +253,8 @@ def get_tides():
             "timezone": TZ_NAME,
             "forecast_days": 2,
         },
-        timeout=20,
     )
-    r.raise_for_status()
-    h = r.json()["hourly"]
+    h = data["hourly"]
     series = [(datetime.datetime.fromisoformat(t).replace(tzinfo=TZ), v)
               for t, v in zip(h["time"], h["sea_level_height_msl"]) if v is not None]
     if len(series) < 24:
