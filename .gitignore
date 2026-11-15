@@ -1,0 +1,4 @@
+# Python by-products and the font the Action downloads; never commit these
+__pycache__/
+*.pyc
+fonts/
