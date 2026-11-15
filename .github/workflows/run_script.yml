@@ -20,7 +20,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 8   # allows for the weather retries when Open-Meteo is busy
     steps:
       - name: Checkout repository code
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
@@ -42,6 +42,7 @@ jobs:
         run: bash get_fonts.sh
 
       - name: Run generation script with Secrets injected
+        id: generate
         env:
           LATITUDE: ${{ secrets.LATITUDE }}
           LONGITUDE: ${{ secrets.LONGITUDE }}
@@ -49,12 +50,25 @@ jobs:
           TIMEZONE: ${{ secrets.TIMEZONE }}
           TIDE_LATITUDE: ${{ secrets.TIDE_LATITUDE }}
           TIDE_LONGITUDE: ${{ secrets.TIDE_LONGITUDE }}
-        run: python script.py
+        run: |
+          # Remove any old copies first, so an old picture can never be published by mistake.
+          rm -f dashboard.jpg dashboard.json
+          # "python script.py && rc=0 || rc=$?" captures the exit code instead of stopping here.
+          python script.py && rc=0 || rc=$?
+          if [ "$rc" = "75" ]; then
+            # Code 75 = the weather service was busy or down. Skip this update quietly:
+            # the old picture stays up and the next run (30 minutes later) tries again.
+            echo "::warning title=Weather service unavailable::Open-Meteo did not answer after several tries. Skipped this update; the previous picture stays on the dashboard branch."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" != "0" ]; then
+            exit "$rc"      # a real problem: fail the run as normal
+          fi
 
       # Publish the two files to a branch called "dashboard". Each time, a brand-new
       # one-commit history is created and force-pushed over the old one, so the repo
       # never fills up with hundreds of old pictures. The main branch stays for code only.
       - name: Publish the dashboard files to the "dashboard" branch
+        if: steps.generate.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

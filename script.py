@@ -180,16 +180,18 @@ def _fit_size(d, s, bold, max_w, start):
 # =============================================================================
 # 4. WEATHER AND TIDE DATA
 # =============================================================================
-def _fetch_json(url, params, tries=3):
+def _fetch_json(url, params, tries=5):
     """Download JSON from a web address, trying again if the server is slow or fails.
 
-    Open-Meteo is free and sometimes takes a moment to answer. One slow reply used
-    to make the whole update fail (and GitHub sent an email), so we now try up to
-    3 times, waiting a little longer between each try (5 seconds, then 10).
-    If every try fails, the last error is raised and the update stops, so the
-    previous good picture stays on the dashboard branch.
+    Open-Meteo is free, and GitHub's computers share a small number of internet
+    addresses with thousands of other projects. At busy moments (exactly on the
+    hour and half hour) Open-Meteo can answer "429 Too Many Requests" or be slow.
+    So we try up to 5 times, waiting longer each time (10, 20, 30, 40 seconds), or
+    as long as the server asks us to wait if it says so (up to 60 seconds).
+    If every try fails, the last error is raised.
     """
     for attempt in range(1, tries + 1):
+        r = None
         try:
             r = requests.get(url, params=params, timeout=20)
             r.raise_for_status()
@@ -197,7 +199,11 @@ def _fetch_json(url, params, tries=3):
         except (requests.RequestException, ValueError) as e:
             if attempt == tries:
                 raise
-            wait = 5 * attempt
+            wait = 10 * attempt
+            resp = r if r is not None else getattr(e, "response", None)
+            asked = resp.headers.get("Retry-After", "") if resp is not None else ""
+            if asked.isdigit():                       # the server told us how long to wait
+                wait = min(int(asked), 60)
             print("Try %d of %d failed (%s). Trying again in %d seconds."
                   % (attempt, tries, type(e).__name__, wait))
             time.sleep(wait)
@@ -253,6 +259,7 @@ def get_tides():
             "timezone": TZ_NAME,
             "forecast_days": 2,
         },
+        tries=2,   # tides are optional, so don't spend long on them
     )
     h = data["hourly"]
     series = [(datetime.datetime.fromisoformat(t).replace(tzinfo=TZ), v)
@@ -819,7 +826,16 @@ def main():
     except Exception as exc:   # the dashboard still draws without tides
         print("Tide error:", exc)
         tides = None
-    generate_image(get_weather(), tides, now)
+    try:
+        weather = get_weather()
+    except requests.RequestException as exc:
+        # The weather service is busy or down. This is not a fault in our code, so exit
+        # with the special code 75 ("temporary failure"). The GitHub workflow treats 75
+        # as "skip this update quietly": no failure email, and the previous picture stays
+        # on the dashboard branch until the next run, 30 minutes later.
+        print("Weather service unavailable after several tries:", exc)
+        raise SystemExit(75)
+    generate_image(weather, tides, now)
 
 
 if __name__ == "__main__":
